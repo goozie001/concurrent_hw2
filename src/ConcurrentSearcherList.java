@@ -1,5 +1,4 @@
 import java.util.concurrent.locks.*;
-import static java.lang.Thread.yield;
 
 
 public class ConcurrentSearcherList<T> {
@@ -20,10 +19,13 @@ public class ConcurrentSearcherList<T> {
 	 */
 
     private Lock searchLock;
-    private Condition insert;
-    private Condition remove;
-    private volatile int searchers;
+    private Condition insertCondition;
+    private Condition removeCondition;
+    private Condition searchCondition;
+    private int searchers;
+    private int removers;
     private boolean inserting;
+    private boolean removing;
 
     private static class Node<T>{
         final T item;
@@ -35,14 +37,17 @@ public class ConcurrentSearcherList<T> {
         }
     }
 
-    private Node<T> first;
+    // Make volatile to remove race condition between insert and search
+    private volatile Node<T> first;
 
     public ConcurrentSearcherList() {
         first = null;
         searchLock = new ReentrantLock();
-        insert = searchLock.newCondition();
-        remove = searchLock.newCondition();
+        insertCondition = searchLock.newCondition();
+        removeCondition = searchLock.newCondition();
+        searchCondition = searchLock.newCondition();
         searchers = 0;
+        removers = 0;
     }
 
     /**
@@ -98,7 +103,7 @@ public class ConcurrentSearcherList<T> {
      * @throws InterruptedException
      */
     public boolean remove(T item) throws InterruptedException{
-        assert item != null: "Error in ConcurrentSearcherList insert:  Attempt to remove null";
+        assert item != null: "Error in ConcurrentSearcherList insert:  Attempt to removeCondition null";
         start_remove();
         try{
             if(first == null) return false;
@@ -119,8 +124,10 @@ public class ConcurrentSearcherList<T> {
     private void start_insert() throws InterruptedException{
         searchLock.lock();
         try {
-            while (inserting)
-                insert.await();
+            // Wait until there are no inserts or removes currently happening
+            while (inserting || removing) {
+                insertCondition.await();
+            }
             // Now we set inserting to true for this thread
             inserting = true;
         }
@@ -133,9 +140,13 @@ public class ConcurrentSearcherList<T> {
         searchLock.lock();
         try {
             inserting = false;
-            insert.signal();
-            if (searchers == 0)
-                remove.signal();
+            // Try to hand baton to removers waiting first, then to (potential) inserters waiting
+            if (searchers == 0 && removers > 0) {
+                removeCondition.signal();
+            }
+            else {
+                insertCondition.signal();
+            }
         }
         finally {
             searchLock.unlock();
@@ -146,8 +157,9 @@ public class ConcurrentSearcherList<T> {
         searchLock.lock();
         try {
             searchers += 1;
-            if (!inserting)
-                remove.signal();
+            // wait until removing is done, then we can enter the search method
+            while (removing)
+                searchCondition.await();
         }
         finally {
             searchLock.unlock();
@@ -158,21 +170,50 @@ public class ConcurrentSearcherList<T> {
         searchLock.lock();
         try {
             searchers -= 1;
-            if (!inserting)
+            // If we are the last searcher, there is not an insert happening, and there is at least one
+            // remover waiting, signal that remover to start
+            if (searchers == 0 && !inserting && removers > 0) {
+                removeCondition.signal();
+            }
+        }
+        finally {
+            searchLock.unlock();
         }
     }
 
     private void start_remove() throws InterruptedException{
-        // TTAS implementation to only ever have one remover
-        while (nRemovers.get() == 1) {
-            yield();
-            if (nRemovers.compareAndSet(0, 1))
-                break;
+        searchLock.lock();
+        try {
+            removers += 1;
+            // Wait until there are no other operations to continue
+            while (searchers > 0 || inserting || removing)
+                removeCondition.await();
+
+            removing = true;
         }
-        while
+        finally {
+            searchLock.unlock();
+        }
     }
 
     private void end_remove() {
-
+        searchLock.lock();
+        try {
+            removing = false;
+            removers -= 1;
+            // If we have other removes waiting, prioritize those before the search method get multiple threads
+            // performing it again
+            if (removers > 0) {
+                removeCondition.signal();
+            }
+            else {
+                // Signal all searches at once. They will all pass their conditions and search concurrently
+                searchCondition.signalAll();
+                insertCondition.signal(); // Only one insert that is potentially waiting should be signalled
+            }
+        }
+        finally {
+            searchLock.unlock();
+        }
     }
 }
